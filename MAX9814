@@ -1,0 +1,174 @@
+//Arduino Guitar Tuner /w Max9814
+
+#include <LiquidCrystal.h>
+#include <arduinoFFT.h>
+
+LiquidCrystal lcd(12, 11, 5, 4, 3, 2);
+
+#define MIC A0
+#define SAMPLES 128
+#define SAMPLING_FREQUENCY 700
+#define NOISE_FLOOR 15
+#define NUM_READINGS 3
+
+unsigned int sampling_period_us;
+unsigned long microseconds;
+
+float vReal[SAMPLES];
+float vImag[SAMPLES];
+
+ArduinoFFT<float> FFT = ArduinoFFT<float>(vReal, vImag, SAMPLES, SAMPLING_FREQUENCY);
+
+const float noteRanges[][2] = {
+  { 76, 89 },
+  { 104, 116 },
+  { 140, 154 },
+  { 189, 203 },
+  { 241, 253 },
+  { 322, 337 }
+};
+
+const float noteFreqs[] = {82.41, 110.00, 146.83, 196.00, 246.94, 329.63};
+const char* noteNames[] = {"E2", "A2", "D3", "G3", "B3", "E4"};
+
+void setup() {
+  ADCSRA = (ADCSRA & 0xF8) | 0x05;
+
+  sampling_period_us = round(1000000 * (1.0 / SAMPLING_FREQUENCY));
+
+  lcd.begin(16, 2);
+  lcd.print("Guitar Tuner");
+
+  Serial.begin(9600);
+  delay(1000);
+}
+
+void loop() {
+  float totalFreq = 0;
+  int validReadings = 0;
+
+  for (int r = 0; r < NUM_READINGS; r++) {
+    float f = findFrequency();
+    if (f > 50 && f < 350) {
+      totalFreq += f;
+      validReadings++;
+    }
+  }
+
+  if (validReadings == 0) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Strum a string!");
+    delay(200);
+    return;
+  }
+
+  float freq = totalFreq / validReadings;
+
+  Serial.print("Avg: ");
+  Serial.print(freq, 2);
+  Serial.print(" x");
+  Serial.println(validReadings);
+
+  int idx = frequencyToNote(freq);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(noteNames[idx]);
+  lcd.print("  ");
+  lcd.print(freq, 1);
+  lcd.print("Hz");
+
+  float diff = freq - noteFreqs[idx];
+
+  lcd.setCursor(0, 1);
+  if (freq < noteRanges[idx][0]) {
+    lcd.print("FLAT  +");
+    lcd.print(abs(diff), 1);
+    lcd.print("Hz");
+  } else if (freq > noteRanges[idx][1]) {
+    lcd.print("SHARP -");
+    lcd.print(abs(diff), 1);
+    lcd.print("Hz");
+  } else {
+    lcd.print(">>> IN TUNE! <<<");
+  }
+
+  delay(1000);
+}
+
+float findFrequency() {
+  for (int i = 0; i < SAMPLES; i++) {
+    microseconds = micros();
+    int sample = analogRead(MIC);
+    while (micros() < (microseconds + sampling_period_us));
+    vReal[i] = (float)sample;
+    vImag[i] = 0;
+  }
+
+  float avg = 0;
+  for (int i = 0; i < SAMPLES; i++) avg += vReal[i];
+  avg /= SAMPLES;
+
+  float peak = 0;
+  for (int i = 0; i < SAMPLES; i++) {
+    vReal[i] -= avg;
+    if (abs(vReal[i]) > peak) peak = abs(vReal[i]);
+  }
+
+  if (peak < NOISE_FLOOR) return 0;
+
+  for (int i = 0; i < SAMPLES; i++) vImag[i] = 0;
+
+  FFT.windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+  FFT.compute(FFT_FORWARD);
+  FFT.complexToMagnitude();
+
+  float maxMag = 0;
+  for (int i = 2; i < SAMPLES / 2; i++) {
+    if (vReal[i] > maxMag) maxMag = vReal[i];
+  }
+
+  float threshold = maxMag * 0.4;
+  int fundamentalBin = 0;
+
+  int startBin = max(2, (int)(50.0 * SAMPLES / SAMPLING_FREQUENCY));
+  int endBin = min(SAMPLES / 2, (int)(350.0 * SAMPLES / SAMPLING_FREQUENCY));
+
+  for (int i = startBin; i <= endBin; i++) {
+    if (vReal[i] > threshold) {
+      fundamentalBin = i;
+      break;
+    }
+  }
+
+  if (fundamentalBin == 0) return (float)FFT.majorPeak();
+
+  float freq;
+  if (fundamentalBin > 0 && fundamentalBin < SAMPLES / 2 - 1) {
+    float y0 = vReal[fundamentalBin - 1];
+    float y1 = vReal[fundamentalBin];
+    float y2 = vReal[fundamentalBin + 1];
+    float shift = 0.5 * (y0 - y2) / (y0 - 2.0 * y1 + y2);
+    freq = (fundamentalBin + shift) * ((float)SAMPLING_FREQUENCY / SAMPLES);
+  } else {
+    freq = fundamentalBin * ((float)SAMPLING_FREQUENCY / SAMPLES);
+  }
+
+  return freq;
+}
+
+int frequencyToNote(float frequency) {
+  int closest = 0;
+  float closestDiff = abs(frequency - noteFreqs[0]);
+
+  for (int i = 1; i < 6; i++) {
+    float diff = abs(frequency - noteFreqs[i]);
+    if (diff < closestDiff) {
+      closest = i;
+      closestDiff = diff;
+    }
+  }
+
+  return closest;
+}
